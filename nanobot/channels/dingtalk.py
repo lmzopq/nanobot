@@ -660,8 +660,12 @@ class DingTalkChannel(BaseChannel):
         if not token:
             return
 
-        if msg.content and msg.content.strip():
-            await self._send_markdown_text(token, msg.chat_id, msg.content.strip())
+        content = msg.content.strip() if msg.content else ""
+        if content:
+            sender_name = msg.metadata.get("sender_name") if msg.metadata else None
+            if msg.chat_id.startswith("group:") and sender_name:
+                content = f"# @{sender_name}\n\n{content}"
+            await self._send_markdown_text(token, msg.chat_id, content)
 
         for media_ref in msg.media or []:
             ok = await self._send_media_ref(token, msg.chat_id, media_ref)
