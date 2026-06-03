@@ -1043,6 +1043,7 @@ Global settings that apply to all channels. Configure under the `channels` secti
   "channels": {
     "sendProgress": true,
     "sendToolHints": false,
+    "extractDocumentText": true,
     "sendMaxRetries": 3,
     "transcriptionProvider": "groq",
     "transcriptionLanguage": null,
@@ -1056,6 +1057,7 @@ Global settings that apply to all channels. Configure under the `channels` secti
 | `sendProgress` | `true` | Stream agent's text progress to the channel |
 | `sendToolHints` | `false` | Stream tool-call hints (e.g. `read_file("…")`) |
 | `showReasoning` | `true` | Allow channels to surface model reasoning/thinking content (DeepSeek-R1 `reasoning_content`, Anthropic `thinking_blocks`, inline `<think>` tags). Reasoning flows as a dedicated stream with `_reasoning_delta` / `_reasoning_end` markers — channels override `send_reasoning_delta` / `send_reasoning_end` to render in-place updates. Even with `true`, channels without those overrides stay no-op silently. Currently surfaced on CLI and WebSocket/WebUI (italic shimmer header, auto-collapses after the stream ends); Telegram / Slack / Discord / Feishu / WeChat / Matrix keep the base no-op until their bubble UI is adapted. Independent of `sendProgress`. |
+| `extractDocumentText` | `true` | Extract supported document/text attachments into the model prompt. Set to `false` to keep document content out of the prompt and include attachment path references instead. |
 | `sendMaxRetries` | `3` | Max delivery attempts per outbound message, including the initial send (0-10 configured, minimum 1 actual attempt) |
 | `transcriptionProvider` | `"groq"` | Voice transcription backend: `"groq"` (free tier, default) or `"openai"`. API key and optional `apiBase` are auto-resolved from the matching provider config. Chat-style bases such as `https://api.groq.com/openai/v1` are normalized to the audio transcription endpoint. |
 | `transcriptionLanguage` | `null` | Optional ISO-639-1 language hint for audio transcription, e.g. `"en"`, `"ko"`, `"ja"`. |
@@ -1153,6 +1155,7 @@ By default, web search uses `duckduckgo`, and it works out of the box without an
 | `jina` | `apiKey` | `JINA_API_KEY` | Free tier (10M tokens) |
 | `kagi` | `apiKey` | `KAGI_API_KEY` | No |
 | `olostep` | `apiKey` | `OLOSTEP_API_KEY` | No |
+| `volcengine` | `apiKey` | `VOLCENGINE_SEARCH_API_KEY` or `WEB_SEARCH_API_KEY` | Monthly quota, then paid |
 | `searxng` | `baseUrl` | `SEARXNG_BASE_URL` | Yes (self-hosted) |
 | `duckduckgo` (default) | — | — | Yes |
 
@@ -1228,6 +1231,25 @@ By default, web search uses `duckduckgo`, and it works out of the box without an
 
 You can also set `OLOSTEP_API_KEY` in the environment instead of storing it in config.
 
+**Volcengine Search:**
+```json
+{
+  "tools": {
+    "web": {
+      "search": {
+        "provider": "volcengine",
+        "apiKey": "${VOLCENGINE_SEARCH_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+You can also set `WEB_SEARCH_API_KEY` for compatibility with the Volcengine web-search skill.
+Create the key in the [Volcengine web search console](https://console.volcengine.com/search-infinity/web-search),
+then copy it from [API keys](https://console.volcengine.com/search-infinity/api-key).
+Volcengine Ark keys are separate and do not work for this search provider.
+
 **SearXNG** (self-hosted, no API key needed):
 ```json
 {
@@ -1259,8 +1281,8 @@ You can also set `OLOSTEP_API_KEY` in the environment instead of storing it in c
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `provider` | string | `"duckduckgo"` | Search backend: `brave`, `tavily`, `jina`, `searxng`, `duckduckgo` |
-| `apiKey` | string | `""` | API key for Brave or Tavily |
+| `provider` | string | `"duckduckgo"` | Search backend: `brave`, `tavily`, `jina`, `kagi`, `olostep`, `volcengine`, `searxng`, `duckduckgo` |
+| `apiKey` | string | `""` | API key for API-backed search providers |
 | `baseUrl` | string | `""` | Base URL for SearXNG |
 | `maxResults` | integer | `5` | Results per search (1–10) |
 
@@ -1532,7 +1554,7 @@ By default, nanobot uses `UTC` for runtime time context. If you want the agent t
 }
 ```
 
-This affects runtime time strings shown to the model, such as runtime context and heartbeat prompts. It also becomes the default timezone for cron schedules when a cron expression omits `tz`, and for one-shot `at` times when the ISO datetime has no explicit offset.
+This affects runtime time strings shown to the model, such as runtime context. It also becomes the default timezone for cron schedules when a cron expression omits `tz`, and for one-shot `at` times when the ISO datetime has no explicit offset.
 
 Common examples: `UTC`, `America/New_York`, `America/Los_Angeles`, `Europe/London`, `Europe/Berlin`, `Asia/Tokyo`, `Asia/Shanghai`, `Asia/Singapore`, `Australia/Sydney`.
 

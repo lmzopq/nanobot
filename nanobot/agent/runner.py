@@ -53,6 +53,10 @@ from nanobot.utils.runtime import (
 )
 
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
+_ARREARAGE_ERROR_MESSAGE = (
+    "The AI provider rejected the request because the API key is out of quota or the "
+    "account is in arrears. Please top up / check the billing status of your API key and try again."
+)
 _PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]"
 _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
@@ -65,6 +69,8 @@ _COMPACTABLE_TOOLS = frozenset({
     "read_file", "exec", "grep", "find_files",
     "web_search", "web_fetch", "list_dir", "list_exec_sessions",
 })
+# read_file is the recovery path for persisted results; exempting it prevents persist->read->persist loops.
+_TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS = frozenset({"read_file"})
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
 
 # Backward-compatible module attribute for tests/extensions that monkeypatch
@@ -504,7 +510,10 @@ class AgentRunner:
                 continue
 
             if response.finish_reason == "error":
-                final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
+                if LLMProvider.is_arrearage_response(response):
+                    final_content = _ARREARAGE_ERROR_MESSAGE
+                else:
+                    final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
                 stop_reason = "error"
                 error = final_content
                 self._append_model_error_placeholder(messages)
@@ -1107,6 +1116,9 @@ class AgentRunner:
         result: Any,
     ) -> Any:
         result = ensure_nonempty_tool_result(tool_name, result)
+        if tool_name in _TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS:
+            # Exempt tools bound their own output; skip generic offload and truncation.
+            return result
         try:
             content = maybe_persist_tool_result(
                 spec.workspace,
@@ -1273,7 +1285,13 @@ class AgentRunner:
             return messages
 
         system_tokens = sum(estimate_message_tokens(msg) for msg in system_messages)
-        remaining_budget = max(128, budget - system_tokens)
+        fixed_tokens, _ = estimate_prompt_tokens_chain(
+            self.provider,
+            spec.model,
+            system_messages,
+            spec.tools.get_definitions(),
+        )
+        remaining_budget = max(0, budget - max(system_tokens, fixed_tokens))
         kept: list[dict[str, Any]] = []
         kept_tokens = 0
         for message in reversed(non_system):
