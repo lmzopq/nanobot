@@ -21,6 +21,7 @@ from nanobot.bus.events import (
     RUNTIME_CONTROL_MCP_RELOAD,
     InboundMessage,
 )
+from nanobot.security.network import validate_url_target
 
 # Transient connection errors that warrant a single retry.
 # These typically happen when an MCP server restarts or a network
@@ -43,6 +44,76 @@ _WINDOWS_SHELL_LAUNCHERS: frozenset[str] = frozenset(("npx", "npm", "pnpm", "yar
 _SANITIZE_RE = re.compile(r"_+")
 _RELOAD_LOCKS: WeakKeyDictionary[Any, asyncio.Lock] = WeakKeyDictionary()
 _ReconnectCallback = Callable[[str, str, Tool], Awaitable[Tool | None]]
+
+
+def _is_malformed_mcp_progress_notification(message: Any) -> bool:
+    payload = _mcp_jsonrpc_payload(message)
+    if _payload_value(payload, "method") != "notifications/progress":
+        return False
+
+    params = _payload_value(payload, "params")
+    return not _progress_params_have_token(params)
+
+
+def _mcp_jsonrpc_payload(message: Any) -> Any:
+    """Return the JSON-RPC payload across current and future MCP SDK shapes."""
+    envelope = getattr(message, "message", message)
+    return getattr(envelope, "root", None) or envelope
+
+
+def _payload_value(payload: Any, key: str) -> Any:
+    if isinstance(payload, Mapping):
+        return payload.get(key)
+    return getattr(payload, key, None)
+
+
+def _progress_params_have_token(params: Any) -> bool:
+    if isinstance(params, Mapping):
+        return "progressToken" in params
+    return hasattr(params, "progressToken") or hasattr(params, "progress_token")
+
+
+class _MalformedProgressNotificationFilter:
+    def __init__(self, read_stream: Any, server_name: str) -> None:
+        self._read_stream = read_stream
+        self._server_name = server_name
+        self._iterator: Any | None = None
+
+    async def __aenter__(self) -> "_MalformedProgressNotificationFilter":
+        await self._read_stream.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        return await self._read_stream.__aexit__(exc_type, exc, tb)
+
+    def __aiter__(self) -> "_MalformedProgressNotificationFilter":
+        self._iterator = self._read_stream.__aiter__()
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._iterator is None:
+            self._iterator = self._read_stream.__aiter__()
+
+        while True:
+            message = await self._iterator.__anext__()
+            if _is_malformed_mcp_progress_notification(message):
+                logger.debug(
+                    "MCP server '{}': dropped progress notification without progressToken",
+                    self._server_name,
+                )
+                continue
+            return message
+
+    async def aclose(self) -> None:
+        close = getattr(self._read_stream, "aclose", None)
+        if close is not None:
+            await close()
+
+
+def _filter_malformed_mcp_progress_notifications(read_stream: Any, server_name: str) -> Any:
+    if not all(hasattr(read_stream, name) for name in ("__aenter__", "__aexit__", "__aiter__")):
+        return read_stream
+    return _MalformedProgressNotificationFilter(read_stream, server_name)
 
 
 def _sanitize_name(name: str) -> str:
@@ -87,10 +158,21 @@ async def _probe_http_url(url: str, timeout: float = 3.0) -> bool:
             timeout=timeout,
         )
         writer.close()
-        await writer.wait_closed()
+        with suppress(OSError, asyncio.TimeoutError):
+            await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
         return True
     except (OSError, asyncio.TimeoutError):
         return False
+
+
+async def _validate_mcp_request_url(request: httpx.Request) -> None:
+    """Validate each outgoing MCP HTTP request, including redirect targets."""
+    ok, error = validate_url_target(str(request.url))
+    if not ok:
+        raise httpx.RequestError(
+            f"Blocked unsafe MCP URL {request.url} ({error})",
+            request=request,
+        )
 
 
 def _windows_command_basename(command: str) -> str:
@@ -595,6 +677,18 @@ async def connect_mcp_servers(
                     await server_stack.aclose()
                     return name, None
 
+            if transport_type in {"sse", "streamableHttp"}:
+                ok, error = validate_url_target(cfg.url)
+                if not ok:
+                    logger.warning(
+                        "MCP server '{}': blocked unsafe URL {} ({})",
+                        name,
+                        cfg.url,
+                        error,
+                    )
+                    await server_stack.aclose()
+                    return name, None
+
             if transport_type == "stdio":
                 command, args, env = _normalize_windows_stdio_command(
                     cfg.command,
@@ -626,6 +720,7 @@ async def connect_mcp_servers(
                     }
                     return httpx.AsyncClient(
                         headers=merged_headers or None,
+                        event_hooks={"request": [_validate_mcp_request_url]},
                         follow_redirects=True,
                         timeout=timeout,
                         auth=auth,
@@ -643,8 +738,9 @@ async def connect_mcp_servers(
                 http_client = await server_stack.enter_async_context(
                     httpx.AsyncClient(
                         headers=cfg.headers or None,
+                        event_hooks={"request": [_validate_mcp_request_url]},
                         follow_redirects=True,
-                        timeout=None,
+                        timeout=httpx.Timeout(30.0, connect=10.0),
                     )
                 )
                 read, write, _ = await server_stack.enter_async_context(
@@ -655,6 +751,7 @@ async def connect_mcp_servers(
                 await server_stack.aclose()
                 return name, None
 
+            read = _filter_malformed_mcp_progress_notifications(read, name)
             session = await server_stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
 
