@@ -70,7 +70,7 @@ class ToolRegistry:
 
     def has(self, name: str) -> bool:
         """Check if a tool is registered."""
-        return name in self._tools
+        return self.get(name) is not None
 
     @staticmethod
     def _schema_name(schema: dict[str, Any]) -> str:
@@ -87,9 +87,8 @@ class ToolRegistry:
         """Get tool definitions with stable ordering for cache-friendly prompts.
 
         Built-in tools are sorted first as a stable prefix, then MCP tools are
-        sorted and appended.  The result is cached until the next
-        register/unregister call. Request-scoped availability is applied after
-        the cached schemas are built.
+        sorted and appended. The result is cached until the next
+        register/unregister call.
         """
         if self._cached_definitions is None:
             definitions = [tool.to_schema() for tool in self._tools.values()]
@@ -106,11 +105,7 @@ class ToolRegistry:
             mcp_tools.sort(key=self._schema_name)
             self._cached_definitions = builtins + mcp_tools
 
-        return [
-            schema
-            for schema in self._cached_definitions
-            if self._tools[self._schema_name(schema)].available()
-        ]
+        return self._cached_definitions
 
     def prepare_call(
         self,
@@ -118,7 +113,7 @@ class ToolRegistry:
         params: Any,
     ) -> tuple[Tool | None, Any, str | None]:
         """Resolve, cast, and validate one tool call."""
-        tool = self._tools.get(name)
+        tool = self.get(name)
         if not tool:
             suggestion = self._suggest_name(str(name))
             hint = f" Did you mean '{suggestion}'? Tool names must match exactly." if suggestion else ""
@@ -127,9 +122,6 @@ class ToolRegistry:
                     f"Error: Tool '{name}' not found.{hint} Available: {', '.join(self.tool_names)}"
                 )
             )
-        if not tool.available():
-            return None, params, ToolResult.error(f"Error: Tool '{name}' is unavailable")
-
         # Compatibility for external tools that still implement the legacy
         # setter protocol. Built-ins read the authoritative ContextVar
         # directly and never copy routing state.
@@ -217,4 +209,4 @@ class ToolRegistry:
         return len(self._tools)
 
     def __contains__(self, name: str) -> bool:
-        return name in self._tools
+        return self.has(name)

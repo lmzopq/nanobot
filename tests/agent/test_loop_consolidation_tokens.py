@@ -2,18 +2,22 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import nanobot.agent.memory as memory_module
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
-from nanobot.session.manager import replay_max_messages_for_context
 
 
-def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -> AgentLoop:
+def _make_loop(
+    tmp_path,
+    *,
+    estimated_tokens: int,
+    context_window_tokens: int,
+    max_tokens: int = 0,
+) -> AgentLoop:
     from nanobot.providers.base import GenerationSettings
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    provider.generation = GenerationSettings(max_tokens=0)
+    provider.generation = GenerationSettings(max_tokens=max_tokens)
     provider.estimate_prompt_tokens.return_value = (estimated_tokens, "test-counter")
     _response = LLMResponse(content="ok", tool_calls=[])
     provider.chat_with_retry = AsyncMock(return_value=_response)
@@ -25,6 +29,9 @@ def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -
         workspace=tmp_path,
         model="test-model",
         context_window_tokens=context_window_tokens,
+        # These tests isolate Memory consolidation; Runner request fitting is
+        # covered separately with realistic context windows.
+        context_block_limit=10_000,
     )
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop.consolidator._SAFETY_BUFFER = 0
@@ -34,161 +41,101 @@ def _make_loop(tmp_path, *, estimated_tokens: int, context_window_tokens: int) -
 @pytest.mark.asyncio
 async def test_prompt_below_threshold_does_not_consolidate(tmp_path) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
-    loop.consolidator.archive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    loop.consolidator.archive_session = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
     await loop.process_direct("hello", session_key="cli:test")
 
-    loop.consolidator.archive.assert_not_awaited()
+    loop.consolidator.archive_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_prompt_above_threshold_triggers_consolidation(tmp_path, monkeypatch) -> None:
+async def test_prompt_above_threshold_triggers_consolidation(tmp_path) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=1000, context_window_tokens=200)
-    loop.consolidator.archive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    loop.consolidator.archive_session = AsyncMock(return_value=True)  # type: ignore[method-assign]
     session = loop.sessions.get_or_create("cli:test")
     session.messages = [
-        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
-        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
-        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
+        {"role": role, "content": f"{role[0]}{turn}"}
+        for turn in range(10)
+        for role in ("user", "assistant")
     ]
     loop.sessions.save(session)
-    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _message: 500)
 
     await loop.process_direct("hello", session_key="cli:test")
 
-    assert loop.consolidator.archive.await_count >= 1
+    assert loop.consolidator.archive_session.await_count >= 1
 
 
 @pytest.mark.asyncio
-async def test_prompt_above_threshold_archives_until_next_user_boundary(tmp_path, monkeypatch) -> None:
+async def test_token_consolidation_refreshes_summary_for_current_request(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
+    loop.consolidator.archive_session = AsyncMock(  # type: ignore[method-assign]
+        return_value="FRESH_CHECKPOINT"
+    )
+    loop.consolidator.estimate_session_prompt_tokens = MagicMock(  # type: ignore[method-assign]
+        return_value=(1000, "test")
+    )
+    loop.schedule_background = lambda coro: coro.close()  # type: ignore[method-assign]
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = [
+        {"role": role, "content": f"{role[0]}{turn}"}
+        for turn in range(10)
+        for role in ("user", "assistant")
+    ]
+    loop.sessions.save(session)
+
+    await loop.process_direct("hello", session_key="cli:test")
+
+    request_messages = loop.provider.chat_with_retry.await_args.kwargs["messages"]
+    system_prompt = request_messages[0]["content"]
+    assert "FRESH_CHECKPOINT" in system_prompt
+    assert all(message.get("content") != "u0" for message in request_messages)
+    assert loop.sessions.get_or_create("cli:test").last_archived == 12
+
+
+@pytest.mark.asyncio
+async def test_prompt_above_threshold_uses_fixed_recent_tail(tmp_path) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=1000, context_window_tokens=200)
-    loop.consolidator.archive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    loop.consolidator.archive_session = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
     session = loop.sessions.get_or_create("cli:test")
     session.messages = [
-        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
-        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
-        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
-        {"role": "assistant", "content": "a2", "timestamp": "2026-01-01T00:00:03"},
-        {"role": "user", "content": "u3", "timestamp": "2026-01-01T00:00:04"},
+        {"role": role, "content": f"{role[0]}{turn}"}
+        for turn in range(10)
+        for role in ("user", "assistant")
     ]
     loop.sessions.save(session)
-
-    token_map = {"u1": 120, "a1": 120, "u2": 120, "a2": 120, "u3": 120}
-    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda message: token_map[message["content"]])
 
     await loop.consolidator.maybe_consolidate_by_tokens(
         session,
         runtime=loop.llm_runtime(),
     )
 
-    archived_chunk = loop.consolidator.archive.await_args.args[0]
-    assert [message["content"] for message in archived_chunk] == ["u1", "a1", "u2", "a2"]
-    assert session.last_consolidated == 4
+    archive_end = loop.consolidator.archive_session.await_args.kwargs["archive_end"]
+    archived_chunk = session.messages[:archive_end]
+    assert [message["content"] for message in archived_chunk] == [
+        "u0", "a0", "u1", "a1", "u2", "a2", "u3", "a3", "u4", "a4", "u5", "a5",
+    ]
+    assert session.last_archived == 12
 
 
 @pytest.mark.asyncio
-async def test_consolidation_loops_until_target_met(tmp_path, monkeypatch) -> None:
-    """Verify maybe_consolidate_by_tokens keeps looping until under threshold."""
+async def test_consolidation_persists_summary_for_next_prepare_session(tmp_path) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
-    loop.consolidator.archive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    loop.consolidator.archive_session = AsyncMock(return_value="User discussed project status.")  # type: ignore[method-assign]
 
     session = loop.sessions.get_or_create("cli:test")
     session.messages = [
-        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
-        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
-        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
-        {"role": "assistant", "content": "a2", "timestamp": "2026-01-01T00:00:03"},
-        {"role": "user", "content": "u3", "timestamp": "2026-01-01T00:00:04"},
-        {"role": "assistant", "content": "a3", "timestamp": "2026-01-01T00:00:05"},
-        {"role": "user", "content": "u4", "timestamp": "2026-01-01T00:00:06"},
+        {"role": role, "content": f"{role[0]}{turn}"}
+        for turn in range(5)
+        for role in ("user", "assistant")
     ]
     loop.sessions.save(session)
 
-    call_count = [0]
     def mock_estimate(_session, *, runtime):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            return (500, "test")
-        if call_count[0] == 2:
-            return (300, "test")
-        return (80, "test")
+        return (500, "test")
 
     loop.consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]
-    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 100)
-
-    await loop.consolidator.maybe_consolidate_by_tokens(
-        session,
-        runtime=loop.llm_runtime(),
-    )
-
-    assert loop.consolidator.archive.await_count == 2
-    assert session.last_consolidated == 6
-
-
-@pytest.mark.asyncio
-async def test_consolidation_continues_below_trigger_until_half_target(tmp_path, monkeypatch) -> None:
-    """Once triggered, consolidation should continue until it drops below half threshold."""
-    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
-    loop.consolidator.archive = AsyncMock(return_value=True)  # type: ignore[method-assign]
-
-    session = loop.sessions.get_or_create("cli:test")
-    session.messages = [
-        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
-        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
-        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
-        {"role": "assistant", "content": "a2", "timestamp": "2026-01-01T00:00:03"},
-        {"role": "user", "content": "u3", "timestamp": "2026-01-01T00:00:04"},
-        {"role": "assistant", "content": "a3", "timestamp": "2026-01-01T00:00:05"},
-        {"role": "user", "content": "u4", "timestamp": "2026-01-01T00:00:06"},
-    ]
-    loop.sessions.save(session)
-
-    call_count = [0]
-
-    def mock_estimate(_session, *, runtime):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            return (500, "test")
-        if call_count[0] == 2:
-            return (150, "test")
-        return (80, "test")
-
-    loop.consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]
-    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 100)
-
-    await loop.consolidator.maybe_consolidate_by_tokens(
-        session,
-        runtime=loop.llm_runtime(),
-    )
-
-    assert loop.consolidator.archive.await_count == 2
-    assert session.last_consolidated == 6
-
-
-@pytest.mark.asyncio
-async def test_consolidation_persists_summary_for_next_prepare_session(tmp_path, monkeypatch) -> None:
-    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
-    loop.consolidator.archive = AsyncMock(return_value="User discussed project status.")  # type: ignore[method-assign]
-
-    session = loop.sessions.get_or_create("cli:test")
-    session.messages = [
-        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
-        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
-        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
-    ]
-    loop.sessions.save(session)
-
-    call_count = [0]
-
-    def mock_estimate(_session, *, runtime):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            return (500, "test")
-        return (80, "test")
-
-    loop.consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]
-    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 150)
 
     await loop.consolidator.maybe_consolidate_by_tokens(
         session,
@@ -202,7 +149,7 @@ async def test_consolidation_persists_summary_for_next_prepare_session(tmp_path,
 
     reloaded, pending = loop.auto_compact.prepare_session(reloaded, "cli:test")
     assert pending is not None
-    assert "User discussed project status." in pending
+    assert pending["text"] == "User discussed project status."
     # _last_summary persists for restart survival.
     assert "_last_summary" in reloaded.metadata
 
@@ -212,7 +159,10 @@ async def test_preflight_consolidation_receives_pending_summary(tmp_path) -> Non
     loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
     session = loop.sessions.get_or_create("cli:test")
     loop.auto_compact.prepare_session = MagicMock(
-        return_value=(session, "Previous conversation summary: earlier context")
+        return_value=(
+            session,
+            {"text": "earlier context", "last_active": session.updated_at.isoformat()},
+        )
     )  # type: ignore[method-assign]
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)  # type: ignore[method-assign]
     loop.schedule_background = lambda coro: coro.close()  # type: ignore[method-assign]
@@ -223,7 +173,6 @@ async def test_preflight_consolidation_receives_pending_summary(tmp_path) -> Non
     loop.consolidator.maybe_consolidate_by_tokens.assert_any_await(
         session,
         runtime=runtime,
-        replay_max_messages=replay_max_messages_for_context(runtime.context_window_tokens),
     )
     assert len(loop.consolidator.maybe_consolidate_by_tokens.call_args_list) == 2
     assert all(
@@ -233,7 +182,7 @@ async def test_preflight_consolidation_receives_pending_summary(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) -> None:
+async def test_preflight_consolidation_before_llm_call(tmp_path) -> None:
     """Verify preflight consolidation runs before the LLM call in process_direct."""
     order: list[str] = []
 
@@ -241,11 +190,11 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
 
     archived_session_keys: list[str | None] = []
 
-    async def track_consolidate(messages, *, runtime, session_key=None):
+    async def track_consolidate(session, *, archive_end, runtime):
         order.append("consolidate")
-        archived_session_keys.append(session_key)
+        archived_session_keys.append(session.key)
         return True
-    loop.consolidator.archive = track_consolidate  # type: ignore[method-assign]
+    loop.consolidator.archive_session = track_consolidate  # type: ignore[method-assign]
 
     async def track_llm(*args, **kwargs):
         order.append("llm")
@@ -256,13 +205,11 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
 
     session = loop.sessions.get_or_create("cli:test")
     session.messages = [
-        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
-        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
-        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
+        {"role": role, "content": f"{role[0]}{turn}"}
+        for turn in range(10)
+        for role in ("user", "assistant")
     ]
     loop.sessions.save(session)
-    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 500)
-
     call_count = [0]
     def mock_estimate(_session, *, runtime):
         call_count[0] += 1
