@@ -20,9 +20,7 @@ from nanobot.bus.events import (
     InboundMessage,
 )
 from nanobot.runtime_context import (
-    RUNTIME_CONTEXT_END,
     RUNTIME_CONTEXT_MESSAGE_META,
-    RUNTIME_CONTEXT_TAG,
     RuntimeContextBlock,
     append_runtime_context,
 )
@@ -93,8 +91,6 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
     _SKIPPABLE_DEFAULTS = {"AGENTS.md", "USER.md"}
-    _RUNTIME_CONTEXT_TAG = RUNTIME_CONTEXT_TAG
-    _RUNTIME_CONTEXT_END = RUNTIME_CONTEXT_END
 
     def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
         self.workspace = workspace
@@ -146,7 +142,7 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
-        if session_summary:
+        if session_summary and session_summary["text"] != "(nothing)":
             parts.append(
                 "[Archived Context Summary]\n\n"
                 f"Previous conversation summary (last active {session_summary['last_active']}):\n"
@@ -235,7 +231,7 @@ class ContextBuilder:
     def build_messages(
         self,
         history: list[dict[str, Any]],
-        current_message: str,
+        current_message: str | None,
         *,
         media: list[str] | None = None,
         channel: str | None = None,
@@ -259,6 +255,8 @@ class ContextBuilder:
             workspace=workspace,
             include_memory=include_memory,
         )
+        if current_message is None:
+            return messages
         current = messages[-1]
         if len(messages) < 2 or messages[-2].get("role") != current.get("role"):
             return messages
